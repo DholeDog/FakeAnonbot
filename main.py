@@ -1,185 +1,265 @@
 import os
 import json
-from aiohttp import web
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+import time
+import threading
+from typing import Dict, Set
+
+from flask import Flask
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
-    Application, ContextTypes, MessageHandler, CommandHandler,
-    CallbackQueryHandler, filters
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
 )
 
-# بارگذاری متغیرهای محیطی
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID"))
+# -----------------------------
+# Config
+# -----------------------------
+TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"])
 
-USERS_FILE = "data/users.json"
-BLOCKED_FILE = "data/blocked.json"
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+BLOCK_FILE = os.path.join(DATA_DIR, "blocked.json")
+MAP_FILE = os.path.join(DATA_DIR, "map.json")
 
-# ابزار JSON ساده
-def load_json(path):
+# Anti-spam (ساده و سبک)
+MIN_SECONDS_BETWEEN_MSGS = int(os.environ.get("MIN_SECONDS_BETWEEN_MSGS", "2"))
+
+# -----------------------------
+# Tiny persistence helpers
+# توجه: روی هاست‌های رایگان ممکنه بعد از redeploy فایل‌ها پاک بشن
+# ولی برای کارکرد روزمره خوبه.
+# -----------------------------
+def load_json(path: str, default):
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
-        return {}
+    except Exception:
+        return default
 
-def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f)
+def save_json(path: str, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass
 
-# شروع برای کاربر ناشناس
+blocked_users: Set[int] = set(load_json(BLOCK_FILE, []))
+# map: admin_message_id -> user_id (برای اینکه اگر ادمین روی پیام ریپلای کرد، بفهمیم برای کیه)
+admin_msg_to_user: Dict[str, int] = load_json(MAP_FILE, {})
+
+# rate limit in-memory: user_id -> last_time
+last_msg_time: Dict[int, float] = {}
+
+# -----------------------------
+# Keep-alive web server
+# -----------------------------
+web_app = Flask(__name__)
+
+@web_app.get("/health")
+def health():
+    return "ok", 200
+
+def run_web():
+    port = int(os.environ.get("PORT", "8080"))
+    web_app.run(host="0.0.0.0", port=port)
+
+# -----------------------------
+# Bot logic
+# -----------------------------
+def user_display(u) -> str:
+    # اطلاعاتی که فقط ادمین می‌بیند
+    name = (u.full_name or "").strip()
+    username = f"@{u.username}" if u.username else "(no username)"
+    return f"{name} | {username} | id={u.id}"
+
+def admin_keyboard(user_id: int, is_blocked: bool) -> InlineKeyboardMarkup:
+    if is_blocked:
+        btn = InlineKeyboardButton("✅ Unblock", callback_data=f"unblock:{user_id}")
+    else:
+        btn = InlineKeyboardButton("⛔ Block", callback_data=f"block:{user_id}")
+    return InlineKeyboardMarkup([[btn]])
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    blocked = load_json(BLOCKED_FILE)
-    if str(user_id) in blocked:
-        await update.message.reply_text("❌ شما بلاک شده‌اید و نمی‌توانید پیام دهید.")
+    await update.message.reply_text(
+        "سلام! پیام‌تو بنویس؛ من ناشناس ارسالش می‌کنم برای پژمان."
+    )
+
+async def help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
         return
     await update.message.reply_text(
-        "به ربات ناشناس پژمان خوش اومدی 💬\n"
-        "هر پیامی بفرستی، ناشناس برای پژمان ارسال میشه. ✉️"
+        "راهنما (ادمین):\n"
+        "• برای جواب دادن، روی پیام کاربر که برات میاد Reply کن.\n"
+        "• /block <user_id>\n"
+        "• /unblock <user_id>\n"
+        "• /blocked (لیست بلاک‌ها)\n"
     )
 
-# دریافت پیام از کاربران ناشناس
-async def handle_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def blocked_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return
+    if not blocked_users:
+        await update.message.reply_text("لیست بلاک خالیه.")
+        return
+    await update.message.reply_text("Blocked user_ids:\n" + "\n".join(map(str, sorted(blocked_users))))
+
+async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("استفاده: /block <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+        blocked_users.add(uid)
+        save_json(BLOCK_FILE, list(blocked_users))
+        await update.message.reply_text(f"⛔ Blocked: {uid}")
+    except ValueError:
+        await update.message.reply_text("user_id باید عددی باشه.")
+
+async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("استفاده: /unblock <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+        blocked_users.discard(uid)
+        save_json(BLOCK_FILE, list(blocked_users))
+        await update.message.reply_text(f"✅ Unblocked: {uid}")
+    except ValueError:
+        await update.message.reply_text("user_id باید عددی باشه.")
+
+async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+
     user = update.effective_user
     user_id = user.id
-    message = update.message
 
-    blocked = load_json(BLOCKED_FILE)
-    if str(user_id) in blocked:
-        await message.reply_text("❌ شما بلاک شده‌اید.")
+    # اگر بلاک است، هیچ واکنشی نده یا یک پیام کوتاه بده
+    if user_id in blocked_users:
+        # برای اینکه لو نره بلاک شده، می‌تونی سکوت کنی؛ ولی اینجا مودبانه جواب می‌دیم:
+        await msg.reply_text("فعلاً امکان ارسال پیام نیست.")
         return
 
-    users = load_json(USERS_FILE)
-    msg_id = str(message.message_id)
-    users[msg_id] = {"from_id": user_id, "type": "new"}
-    save_json(USERS_FILE, users)
+    # rate limit ساده برای جلوگیری از اسپم و فشار روی هاست
+    now = time.time()
+    last = last_msg_time.get(user_id, 0)
+    if now - last < MIN_SECONDS_BETWEEN_MSGS:
+        await msg.reply_text("لطفاً کمی صبر کن و دوباره بفرست.")
+        return
+    last_msg_time[user_id] = now
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✉️ پاسخ به این پیام", callback_data=f"reply_{msg_id}")],
-        [InlineKeyboardButton("🚫 بلاک کاربر", callback_data=f"block_{user_id}")]
-    ])
+    text = msg.text or ""
+    if not text.strip():
+        await msg.reply_text("فقط پیام متنی پشتیبانی می‌شود.")
+        return
 
-    await context.bot.forward_message(OWNER_ID, user_id, message.message_id)
-    await context.bot.send_message(
-        chat_id=OWNER_ID,
-        text=(
-            f"👤 پیام جدید\n"
-            f"▪️ نام: {user.full_name}\n"
-            f"▪️ یوزرنیم: @{user.username or 'ندارد'}\n"
-            f"▪️ آیدی عددی: {user.id}"
-        ),
-        reply_markup=keyboard
+    # پیام به ادمین: هویت کامل + متن
+    header = (
+        "📩 پیام جدید (برای کاربر ناشناس)\n"
+        f"👤 {user_display(user)}\n"
+        "—\n"
+    )
+    sent = await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=header + text,
+        reply_markup=admin_keyboard(user_id, user_id in blocked_users),
     )
 
-    await message.reply_text("✅ پیامت ارسال شد.")
+    # مپ کردن message_id ادمین به user_id برای Reply
+    admin_msg_to_user[str(sent.message_id)] = user_id
+    save_json(MAP_FILE, admin_msg_to_user)
 
-# پاسخ پژمان به کاربر
-async def handle_pezhman_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
+    await msg.reply_text("✅ ارسال شد.")
+
+async def on_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ادمین روی پیام “ارسال شده به ادمین” Reply می‌زند
+    msg = update.message
+    if not msg or msg.chat_id != ADMIN_CHAT_ID:
+        return
+    if not msg.reply_to_message:
         return
 
-    reply_to = context.user_data.get("reply_to")
-    if not reply_to:
-        await update.message.reply_text("⛔ اول دکمه «پاسخ به پیام» رو بزن.")
+    replied_id = str(msg.reply_to_message.message_id)
+    target_user_id = admin_msg_to_user.get(replied_id)
+    if not target_user_id:
+        return  # این ریپلای مربوط به پیام‌های ربات نبود
+
+    if target_user_id in blocked_users:
+        await msg.reply_text("این کاربر بلاک است. اگر می‌خواهی جواب دهی، اول Unblock کن.")
         return
 
-    users = load_json(USERS_FILE)
-    info = users.get(reply_to)
-    if not info:
-        await update.message.reply_text("⛔ پیام اصلی پیدا نشد.")
+    text = msg.text or ""
+    if not text.strip():
+        await msg.reply_text("فقط پیام متنی برای ریپلای پشتیبانی می‌شود.")
         return
 
-    target_id = info["from_id"]
-    reply_text = update.message.text
+    # ارسال جواب به کاربر
+    await context.bot.send_message(chat_id=target_user_id, text=f"📨 پاسخ پژمان:\n{text}")
+    await msg.reply_text("✅ ارسال شد به کاربر.")
 
-    prompt = await context.bot.send_message(
-        chat_id=target_id,
-        text="📩 شما یک پیام جدید دارید:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📬 مشاهده پیام", callback_data=f"seen_{update.message.message_id}_{reply_to}")]
-        ])
-    )
-
-    context.bot_data[f"reply_msg_{update.message.message_id}"] = reply_text
-    context.user_data["reply_to"] = None
-    await update.message.reply_text("✅ پیام ارسال شد.")
-
-# مشاهده پیام توسط کاربر ناشناس
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-    await query.answer()
-
-    if data.startswith("reply_"):
-        msg_id = data.split("_")[1]
-        context.user_data["reply_to"] = msg_id
-        await query.message.reply_text("📝 پیام خودت رو بنویس.")
-
-    elif data.startswith("block_"):
-        target_id = data.split("_")[1]
-        blocked = load_json(BLOCKED_FILE)
-        blocked[str(target_id)] = True
-        save_json(BLOCKED_FILE, blocked)
-        await query.message.reply_text("✅ کاربر بلاک شد.")
-
-    elif data.startswith("seen_"):
-        parts = data.split("_")
-        reply_msg_id = parts[1]
-        user_msg_id = parts[2]
-        users = load_json(USERS_FILE)
-        info = users.get(user_msg_id)
-        if info:
-            reply_text = context.bot_data.get(f"reply_msg_{reply_msg_id}", "")
-            await query.message.reply_text(reply_text, reply_to_message_id=int(user_msg_id))
-            await context.bot.send_message(
-                OWNER_ID,
-                text="👁 پیام خونده شد.",
-                reply_to_message_id=int(reply_msg_id)
-            )
-
-# لیست کاربران بلاک‌شده + آنبلاک
-async def blocked_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
         return
-    blocked = load_json(BLOCKED_FILE)
-    if not blocked:
-        await update.message.reply_text("🚫 هیچ کاربری بلاک نیست.")
+    await q.answer()
+
+    if q.message.chat_id != ADMIN_CHAT_ID:
         return
-    buttons = [
-        [InlineKeyboardButton(f"✅ آنبلاک {uid}", callback_data=f"unblock_{uid}")]
-        for uid in blocked.keys()
-    ]
-    await update.message.reply_text("لیست کاربران بلاک‌شده:", reply_markup=InlineKeyboardMarkup(buttons))
 
-async def unblock_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = update.callback_query.data
-    if data.startswith("unblock_"):
-        uid = data.split("_")[1]
-        blocked = load_json(BLOCKED_FILE)
-        blocked.pop(uid, None)
-        save_json(BLOCKED_FILE, blocked)
-        await update.callback_query.message.reply_text("🔓 کاربر آنبلاک شد.")
-        await update.callback_query.answer()
+    data = q.data or ""
+    try:
+        action, uid_s = data.split(":", 1)
+        uid = int(uid_s)
+    except Exception:
+        return
 
-# Webhook endpoint
-async def webhook_handler(request):
-    data = await request.json()
-    update = Update.de_json(data, application.bot)
-    await application.process_update(update)
-    return web.Response(text="ok")
+    if action == "block":
+        blocked_users.add(uid)
+        save_json(BLOCK_FILE, list(blocked_users))
+        await q.edit_message_reply_markup(reply_markup=admin_keyboard(uid, True))
+        await q.message.reply_text(f"⛔ Blocked: {uid}")
 
-# راه‌اندازی
-application = Application.builder().token(BOT_TOKEN).build()
+    elif action == "unblock":
+        blocked_users.discard(uid)
+        save_json(BLOCK_FILE, list(blocked_users))
+        await q.edit_message_reply_markup(reply_markup=admin_keyboard(uid, False))
+        await q.message.reply_text(f"✅ Unblocked: {uid}")
 
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("blocked", blocked_list))
-application.add_handler(CallbackQueryHandler(unblock_callback, pattern="^unblock_"))
-application.add_handler(CallbackQueryHandler(handle_callback))
-application.add_handler(MessageHandler(filters.TEXT & filters.User(user_id=OWNER_ID), handle_pezhman_reply))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.User(user_id=OWNER_ID), handle_user))
+def main():
+    # start keep-alive web
+    threading.Thread(target=run_web, daemon=True).start()
 
-app = web.Application()
-app.router.add_post("/webhook", webhook_handler)
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_admin))
+    app.add_handler(CommandHandler("block", cmd_block))
+    app.add_handler(CommandHandler("unblock", cmd_unblock))
+    app.add_handler(CommandHandler("blocked", blocked_list))
+
+    # دکمه‌های بلاک/آن‌بلاک زیر پیام‌های ادمین
+    app.add_handler(CallbackQueryHandler(on_button))
+
+    # پیام کاربران (متن)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Chat(ADMIN_CHAT_ID), on_user_message))
+
+    # ریپلای ادمین روی پیام‌های ربات
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Chat(ADMIN_CHAT_ID), on_admin_reply))
+
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    web.run_app(app, port=10000)
+    main()
